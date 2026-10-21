@@ -40,6 +40,19 @@ _raw_stream_fn = None
 # int[] argument cache: value tuple -> host int64 tensor (see _host_ints).
 _INT_CACHE: dict[tuple, object] = {}
 _INT_CACHE_MAX = 64
+# _canonical_chunk_indices is a pure function of (cu_seqlens, chunk_size), and
+# a training step re-issues the same packed batch once per layer, so the
+# sequence-major index list is rebuilt thousands of times a step for the same
+# key.  Cached by value like _INT_CACHE; the cached list is read-only (it goes
+# straight into _host_ints / the operator call, no caller mutates it).  The
+# packed-backward helpers cache the int-ified cu tuple and the varlen tail
+# flag the same way (see _cu_ints / _has_varlen_tail).
+_CHUNK_INDICES_CACHE: dict[tuple, list[int]] = {}
+_CHUNK_INDICES_CACHE_MAX = 256
+_CU_INTS_CACHE: dict[tuple, tuple[int, ...]] = {}
+_CU_INTS_CACHE_MAX = 256
+_CU_TAIL_CACHE: dict[tuple, bool] = {}
+_CU_TAIL_CACHE_MAX = 512
 # Whether the loaded launcher hands its launches to torch_npu's task queue
 # (see _enqueues_launch): that is what makes the non-flushing stream read legal.
 _launcher_enqueues: bool | None = None
@@ -1170,15 +1183,61 @@ def _canonical_chunk_indices(cu_seqlens, chunk_size):
 
     The operator takes both forms; deriving the canonical sequence-major list
     here keeps the call shape the reference accepts without the caller having to
-    build it.
+    build it.  The derivation is a pure function of the inputs and costs ~1 ms
+    for a 1k-chunk batch, so the result is cached by value; the returned list is
+    shared between calls and must be treated as read-only.
+
+    Args:
+        cu_seqlens (list[int]): cumulative sequence boundaries.
+        chunk_size (int): chunk length in tokens.
+
+    Returns:
+        list[int]: the canonical sequence-major ``(seq, local)`` pairs.
     """
 
+    key = (chunk_size, tuple(cu_seqlens))
+    cached = _CHUNK_INDICES_CACHE.get(key)
+    if cached is not None:
+        return cached
     indices = []
     for seq in range(len(cu_seqlens) - 1):
         length = cu_seqlens[seq + 1] - cu_seqlens[seq]
         for local in range((length + chunk_size - 1) // chunk_size):
             indices.extend((seq, local))
+    if len(_CHUNK_INDICES_CACHE) >= _CHUNK_INDICES_CACHE_MAX:
+        _CHUNK_INDICES_CACHE.clear()
+    _CHUNK_INDICES_CACHE[key] = indices
     return indices
+
+
+def _cu_ints(cu_seqlens):
+    """The packed-backward cu tuple, int-ified once per value (see the cache
+    note on _canonical_chunk_indices)."""
+
+    key = tuple(cu_seqlens)
+    cached = _CU_INTS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    ints = tuple(int(x) for x in key)
+    if len(_CU_INTS_CACHE) >= _CU_INTS_CACHE_MAX:
+        _CU_INTS_CACHE.clear()
+    _CU_INTS_CACHE[key] = ints
+    return ints
+
+
+def _has_varlen_tail(cu, chunk_size):
+    """Whether any packed sequence length misses a chunk boundary."""
+
+    key = (chunk_size, cu)
+    cached = _CU_TAIL_CACHE.get(key)
+    if cached is not None:
+        return cached
+    tail = any(
+        (end - begin) % chunk_size != 0 for begin, end in zip(cu, cu[1:]))
+    if len(_CU_TAIL_CACHE) >= _CU_TAIL_CACHE_MAX:
+        _CU_TAIL_CACHE.clear()
+    _CU_TAIL_CACHE[key] = tail
+    return tail
 
 
 def npu_chunk_fwd_h(k, w, u, *, g=None, gk=None, initial_state=None,
@@ -1779,7 +1838,7 @@ def npu_chunk_kda_bwd(q, k, v, beta, gk, Aqk, Akk, w, qg, kg, v_new, h, d_o,
     if not safe_gate:
         raise RuntimeError(
             "npu_chunk_kda_bwd: safe_gate=False is reserved but not supported.")
-    cu = None if cu_seqlens is None else tuple(int(x) for x in cu_seqlens)
+    cu = None if cu_seqlens is None else _cu_ints(cu_seqlens)
     is_varlen = cu is not None
     if is_varlen:
         heads, seqlen = int(q.shape[0]), int(q.shape[1])
@@ -1798,8 +1857,7 @@ def npu_chunk_kda_bwd(q, k, v, beta, gk, Aqk, Akk, w, qg, kg, v_new, h, d_o,
     launch = _kda_bwd_single_launch
 
     use_dense_varlen_fallback = is_varlen and value_dim == 256
-    has_varlen_tail = is_varlen and any(
-        (end - begin) % chunk_size != 0 for begin, end in zip(cu, cu[1:]))
+    has_varlen_tail = is_varlen and _has_varlen_tail(cu, chunk_size)
     is_a2_device = False
     is_a3_device = False
     if use_dense_varlen_fallback or heads % 2 != 0 or has_varlen_tail:
