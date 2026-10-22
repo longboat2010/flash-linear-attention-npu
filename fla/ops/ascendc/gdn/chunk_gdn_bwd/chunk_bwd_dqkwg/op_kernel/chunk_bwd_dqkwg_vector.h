@@ -1197,8 +1197,24 @@ __aicore__ inline void ChunkBwdDqkwgVectorProcess<DataType, GType>::ProcessPart5
                 WholeReduceSum(tensorDgFinal, tensorDkFp32, sum0SumCnt, 1, 1, 1, 8);
 
                 // tensorGLastFp32[0]已经是最后一个位置的 g 值
-                float dgLast = gmDgLast.GetValue(dgLastOffset); // tensorDgTmp暂存dg值，获取最后一个位置的dgLast
-                Duplicate(tensorDgLastFp32Tmp, dgLast, 8); // 广播 dgLast
+                // dgLast 由 Part 1 在其它核上写入 GM，标量 GetValue 不做 cache 维护
+                // (-cce-aicore-dcci-insert-for-scalar=false)，可能读到旧值；改用
+                // DMA 读 + 显式 V/MTE2 flag 配对（与 upstream main 的写法一致）。
+                // 复用 tensorGLastFp32Tmp[8..15] 作为 8 float 的落地缓冲区。
+                {
+                    DataCopyExtParams dgLastCopyParams{1, sizeof(float), 0, 0, 0};
+                    DataCopyPadExtParams<float> dgLastPadParams{true, 0, 7, 0};
+                    TEventID eventIdVToMte2 = GetTPipePtr()->FetchEventID(HardEvent::V_MTE2);
+                    SetFlag<HardEvent::V_MTE2>(eventIdVToMte2);
+                    WaitFlag<HardEvent::V_MTE2>(eventIdVToMte2);
+                    DataCopyPad(tensorGLastFp32Tmp[8], gmDgLast[dgLastOffset],
+                                dgLastCopyParams, dgLastPadParams);
+                    TEventID eventIdMte2ToV = GetTPipePtr()->FetchEventID(HardEvent::MTE2_V);
+                    SetFlag<HardEvent::MTE2_V>(eventIdMte2ToV);
+                    WaitFlag<HardEvent::MTE2_V>(eventIdMte2ToV);
+                    Brcb(tensorDgLastFp32Tmp, tensorGLastFp32Tmp[8], 1, {1, 8}); // 广播 dgLast
+                    PipeBarrier<PIPE_V>();
+                }
                 Exp(tensorGLastFp32Tmp, tensorGLastFp32Tmp, 8);
                 PipeBarrier<PIPE_V>();
                 Mul(tensorDgLastFp32Tmp, tensorDgLastFp32Tmp, tensorGLastFp32Tmp, 8);
