@@ -893,6 +893,14 @@ public:
             // emitted only after BuildKE has completed its workspace store.
             // Consume it before launching zW, whose right operand is kE.
             WaitVectorStage(s0Consumed);
+#if !defined(__CCE_AICORE__) || __CCE_AICORE__ != 310
+            // S3b (and S5 below) re-read dW from GM with MTE2, but dW is the
+            // fixpipe output of S3a just above, so a load that beats the write
+            // reads the previous slot user's bytes and poisons
+            // Zb -> S6/S7 -> dAkk -> dk/db/dg.  A5 needs no fence here:
+            // WaitVectorStage above already fences on that arch.
+            FenceFixToMte2();
+#endif
             for (uint32_t lane = 0; lane < headCount; ++lane) {
                 const uint64_t slot = WyWorkspaceSlotBase(
                     tiling_, coreIdx, localGeneration, lane);
@@ -1004,6 +1012,10 @@ public:
                 WaitVectorStage(s3aConsumed);
             }
 #endif
+            // Tza is S6's fixpipe output and is read back here by MTE2: same
+            // FIX->MTE2 hazard as dW in S3b.  A5 only reaches a fencing wait
+            // in the headCount==1 arm above, so fence on every arch.
+            FenceFixToMte2();
             for (uint32_t pass = 0; pass < squarePasses; ++pass) {
                 for (uint32_t lane = 0; lane < headCount; ++lane) {
                     const uint32_t head = headBase + lane;
@@ -1103,15 +1115,18 @@ public:
 
     __aicore__ inline void FenceFixToMte2()
     {
-#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
         if ASCEND_IS_AIC {
+            // The fixpipe queues its GM writes asynchronously.  Waiting the
+            // FIX_M credit only proves that FIX finished reading L0C, so a
+            // following MTE2 (GM->L1) read of the same buffer can still beat
+            // the write.  Order FIX against MTE2 explicitly before any
+            // contraction consumes a tile this core produced itself.
             constexpr int32_t kFixToMte2Event = 0;
             AscendC::SetFlag<AscendC::HardEvent::FIX_MTE2>(
                 kFixToMte2Event);
             AscendC::WaitFlag<AscendC::HardEvent::FIX_MTE2>(
                 kFixToMte2Event);
         }
-#endif
     }
 
     __aicore__ inline void BeginFusedMmadPhase()
