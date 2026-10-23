@@ -595,4 +595,52 @@ at::Tensor npu_solve_tri(
     return x_out;
 }
 
+std::tuple<at::Tensor, at::Tensor> npu_fla_rms_norm_bwd_dx(
+    const at::Tensor &x,
+    const at::Tensor &rstd,
+    const at::Tensor &gamma,
+    const at::Tensor &dy)
+{
+    at::Tensor dx = at::empty_like(dy);
+
+    // Width of one dgammaPart row, must equal FoldLen() in
+    // fla/ops/ascendc/det/fla_rms_norm_bwd_dx/op_host/fla_rms_norm_bwd_dx_tiling.cpp:
+    // the row path (d <= 4096) folds its row length by halving and therefore needs a
+    // power of two, while the chunked path (> 4096) only needs 32B alignment.
+    int64_t d = x.size(-1);
+    int64_t d_fold = 64;
+    if (d <= 4096) {
+        while (d_fold < d) {
+            d_fold <<= 1;
+        }
+    } else {
+        d_fold = (d + 7) / 8 * 8;
+    }
+    // Deterministic reduction buffer: one fp32 partial vector per AIV core.
+    int64_t dgamma_rows = 64;
+    at::Tensor dgamma_part = at::empty({dgamma_rows, d_fold}, x.options().dtype(at::kFloat));
+
+    EXEC_NPU_CMD_EXT(
+        aclnnFlaRmsNormBwdDx,
+        x, rstd, gamma, dy,
+        dx, dgamma_part
+    );
+    return std::make_tuple(std::move(dx), std::move(dgamma_part));
+}
+
+at::Tensor npu_fla_rms_norm_bwd_dg(
+    const at::Tensor &x,
+    const at::Tensor &gamma,
+    const at::Tensor &dgamma_part)
+{
+    at::Tensor dgamma = at::empty_like(gamma);
+
+    EXEC_NPU_CMD_EXT(
+        aclnnFlaRmsNormBwdDg,
+        x, gamma, dgamma_part,
+        dgamma
+    );
+    return dgamma;
+}
+
 }  // namespace op_api

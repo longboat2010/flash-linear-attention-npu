@@ -12,6 +12,20 @@ _DEFAULT_VENDOR_DIR = "fla_npu_transformer"
 _ASCENDC_OPAPI_LIBRARIES: Optional[list[ctypes.CDLL]] = None
 
 
+def det_backward_enabled() -> bool:
+    """Deterministic backward is on by default.
+
+    ``FLA_NPU_DISABLE_DET_BACKWARD=1`` switches the RMSNorm backward
+    redirection off and restores the built-in ``npu_rms_norm`` backward.
+    """
+    return os.environ.get("FLA_NPU_DISABLE_DET_BACKWARD", "").strip().upper() not in {
+        "1",
+        "TRUE",
+        "YES",
+        "ON",
+    }
+
+
 def _prepend_env_path(name: str, value: pathlib.Path) -> None:
     value_str = str(value)
     parts = [part for part in os.environ.get(name, "").split(os.pathsep) if part]
@@ -31,13 +45,15 @@ def _warn_if_embedded_opp_not_preconfigured() -> None:
         vendor_dir = _resolve_vendor_dir()
     except Exception:
         return
+    required = [vendor_dir, vendor_dir / "op_api" / "lib"]
     parts = [part for part in os.environ.get("ASCEND_CUSTOM_OPP_PATH", "").split(os.pathsep) if part]
-    if str(vendor_dir) in parts:
+    missing = [str(path) for path in required if str(path) not in parts]
+    if not missing:
         return
     warnings.warn(
         "[fla-npu] ASCEND_CUSTOM_OPP_PATH does not contain the custom OPP implements "
         "before import fla_npu, If you need to use fla_npu operators,  run:\n\n"
-        f"  export ASCEND_CUSTOM_OPP_PATH=\"{vendor_dir}:{vendor_dir / 'op_api' / 'lib'}:${{ASCEND_CUSTOM_OPP_PATH:-}}\"",
+        f"  export ASCEND_CUSTOM_OPP_PATH=\"{os.pathsep.join(missing)}:${{ASCEND_CUSTOM_OPP_PATH:-}}\"",
         RuntimeWarning,
         stacklevel=2,
     )
@@ -96,8 +112,10 @@ def _prepare_embedded_opp() -> pathlib.Path:
             f"libcust_opapi.so, or remove the stale alias: {op_api_alias}"
         )
 
-    _prepend_env_path("ASCEND_CUSTOM_OPP_PATH", vendor_dir)
+    # Push the shared OPP root first, then the vendor itself, so the vendor is
+    # searched before it.
     _prepend_env_path("ASCEND_CUSTOM_OPP_PATH", vendor_dir.parent.parent)
+    _prepend_env_path("ASCEND_CUSTOM_OPP_PATH", vendor_dir)
     os.environ["FLA_NPU_OP_API_LIB"] = str(op_api_lib)
     return vendor_dir
 
@@ -187,5 +205,13 @@ def _load_opextension_so():
     from .ops.ascendc import install_torch_npu_ops_compat
 
     install_torch_npu_ops_compat()
+
+    # Wire the RMSNorm backward to the deterministic Ascend C operators shipped
+    # in this wheel (on by default; FLA_NPU_DISABLE_DET_BACKWARD=1 opts out).
+    # Must happen before model code binds ``torch_npu.npu_rms_norm``.
+    if det_backward_enabled():
+        from .ops import det_rms_norm
+
+        det_rms_norm.install()
 
 _load_opextension_so()

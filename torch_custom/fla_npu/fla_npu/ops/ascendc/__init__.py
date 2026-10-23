@@ -25,6 +25,8 @@ _ASCENDC_OPS = (
     "npu_chunk_gated_delta_rule_fwd_h",
     "npu_recompute_w_u_fwd",
     "npu_solve_tri",
+    "npu_fla_rms_norm_bwd_dx",
+    "npu_fla_rms_norm_bwd_dg",
 )
 
 BACKWARD_OPS = {
