@@ -96,6 +96,11 @@ def get_arch() -> str:
     return _compact_tag(arch) or "unknown"
 
 
+def get_wheel_dist_name() -> str:
+    """Wheel distribution name this tree's setup.py produces."""
+    return WHEEL_DIST_NAME
+
+
 def get_vendor_name() -> str:
     return DEFAULT_VENDOR_NAME
 

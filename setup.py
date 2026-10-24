@@ -2,6 +2,7 @@ import importlib
 from importlib import metadata as importlib_metadata
 import importlib.util
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -41,6 +42,10 @@ TORCH_NPU_GDN_FIX_MINIMUMS = {
     "2.7.1": "2.7.1.post5",
     "2.8.0": "2.8.0.post5",
     "2.9.0": "2.9.0.post3",
+    # 2.9.1 is the upstream torch 2.9.1 pairing and ships after the 2.9.0.post3
+    # respin that first carried the GDN aclnn_extension stream fix; without the
+    # entry the lookup misses and the check rejects the version outright.
+    "2.9.1": "2.9.1",
     "2.10.0": "2.10.0.post2",
     "2.11.0": "2.11.0rc3",
     "2.12.0": "2.12.0rc1",
@@ -381,6 +386,11 @@ def _build_run_package():
                     f"{third_party_dir}"
                 )
             cmd.append(f"--cann_3rd_lib_path={third_party_dir.resolve()}")
+        # scripts/build_wheel.py forwards its -g/--sanitizer/--oom/--build-args
+        # through this variable; build.sh parses those options itself.
+        build_args = os.getenv("FLA_NPU_BUILD_ARGS", "").strip()
+        if build_args:
+            cmd.extend(shlex.split(build_args))
         _run(cmd, REPO_ROOT)
 
     return _find_single_run_package()
