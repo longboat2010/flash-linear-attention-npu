@@ -192,5 +192,5 @@ setup(
     install_requires=[
         f"torch=={PYTORCH_VERSION}"
     ],
-    packages=find_packages()
+    packages=find_packages(),
 )

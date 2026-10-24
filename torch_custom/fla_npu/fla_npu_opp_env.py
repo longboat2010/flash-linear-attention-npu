@@ -13,7 +13,7 @@ _VENDOR_DIR = _PACKAGE_DIR / "fla_npu" / "opp" / "vendors" / "fla_npu_transforme
 
 
 def _env_flag(name: str) -> bool:
-    return os.getenv(name, "").upper() in {"1", "TRUE", "YES", "ON"}
+    return os.getenv(name, "").strip().upper() in {"1", "TRUE", "YES", "ON"}
 
 
 def _prepend(name: str, value) -> None:
