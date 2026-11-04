@@ -425,10 +425,12 @@ ge::graphStatus Tiling4KdaGateBwdPost(gert::TilingContext *context)
     constexpr size_t INPUT_DT_BIAS = 3;
     constexpr size_t INPUT_CU_SEQLENS = 4;
     constexpr size_t INPUT_CHUNK_INDICES = 5;
+    constexpr size_t OUTPUT_PARTIALS = 3;
     constexpr size_t ATTR_CHUNK_SIZE = 0;
     constexpr size_t ATTR_SAFE_GATE = 1;
     constexpr size_t ATTR_LOWER_BOUND = 2;
     constexpr size_t ATTR_INPUT_SCANNED = 3;
+    constexpr size_t ATTR_SPLIT_REDUCE = 4;
 
     const auto *attrs = context->GetAttrs();
     const auto *dgShapeStorage =
@@ -478,11 +480,17 @@ ge::graphStatus Tiling4KdaGateBwdPost(gert::TilingContext *context)
                 OP_LOGE(context->GetNodeName(),
                         "rank-3 GatePost requires cu_seqlens/chunk_indices and rank-4 GatePost forbids them"),
                 return ge::GRAPH_FAILED);
+    // The host sizes the split slot plane from raw_g's head axis while the
+    // kernel addresses it with dg's, so a permutation with the same element
+    // count has to be rejected per dimension, not by size alone.
+    bool rawMatchesDg = rawShape.GetDimNum() == dgShape.GetDimNum();
+    for (size_t axis = 0; rawMatchesDg && axis < dgShape.GetDimNum(); ++axis) {
+        rawMatchesDg = rawShape.GetDim(axis) == dgShape.GetDim(axis);
+    }
     OP_CHECK_IF(dgShape.GetDimNum() != (isVarLen ? 3U : 4U) ||
-                    rawShape.GetDimNum() != dgShape.GetDimNum() ||
-                    rawShape.GetShapeSize() != dgShape.GetShapeSize(),
+                    !rawMatchesDg,
                 OP_LOGE(context->GetNodeName(),
-                        "dg_act/raw_g shapes must match canonical BHTK/HTK layout"),
+                        "dg_act/raw_g must have the same canonical BHTK/HTK shape"),
                 return ge::GRAPH_FAILED);
 
     const size_t headAxis = isVarLen ? 0U : 1U;
@@ -534,6 +542,62 @@ ge::graphStatus Tiling4KdaGateBwdPost(gert::TilingContext *context)
     auto *tiling =
         context->GetTilingData<KDA::KdaGateBwdPostTilingData>();
     OP_CHECK_NULL_WITH_CONTEXT(context, tiling);
+    // Split-reduce (varlen + safe-gate only): fan the per-chunk reduction out
+    // over (head, part) tasks in one launch, then fold the per-chunk partials
+    // in a second launch of this same op.  Two launches rather than an
+    // in-kernel rendezvous: only a launch boundary orders one launch's GM
+    // stores against the next launch's GM loads on the same stream; the
+    // kernel supplies the cache clean that makes the slots visible.  The SAFE
+    // tile path reduces every chunk on its own, so the fold's ascending fp32
+    // addition repeats the serial order term for term and stays bitwise
+    // identical.
+    // The dense op def has only the first four attrs; the varlen one adds
+    // split_reduce.
+    const auto *splitReduceAttr =
+        attrs->GetAttrNum() > ATTR_SPLIT_REDUCE
+        ? attrs->GetAttrPointer<int64_t>(ATTR_SPLIT_REDUCE)
+        : nullptr;
+    // A5 (DAV_3510) keeps the single-core legacy launch: the split geometry is
+    // not validated on that arch, and its head map is already serialized.
+    const bool splitEnabled = isVarLen && *safeGate && !isAscend950 &&
+        splitReduceAttr != nullptr && *splitReduceAttr != 0;
+    // 0 = single launch, 1 = produce, 2 = fold, 3 = fold skipped because the
+    // geometry degenerated to a single part (the produce launch then ran the
+    // legacy path and already wrote the final dA/dBias).
+    int32_t splitMode =
+        splitEnabled ? static_cast<int32_t>(*splitReduceAttr) : 0;
+    int64_t splitParts = 1;
+    int64_t chunksPerPart = chunkNum;
+    uint32_t splitUsedCoreNum = usedCoreNum;
+    if (splitMode != 0) {
+        // One part per available AIV keeps every (head, part) task on its own
+        // core.
+        splitParts = std::max<int64_t>(1, std::min<int64_t>(
+            chunkNum, static_cast<int64_t>(availableAiv) / heads));
+        if (splitParts < 2) {
+            // The split would only add a launch and a doubled slot plane.
+            splitMode = splitMode == 1 ? 0 : 3;
+        } else {
+            chunksPerPart = CeilDiv(chunkNum, splitParts);
+            // splitParts <= availableAiv / heads, so the product fits.
+            splitUsedCoreNum = static_cast<uint32_t>(
+                static_cast<int64_t>(heads) * splitParts);
+        }
+    }
+    if (splitMode == 1 || splitMode == 2) {
+        // The produce writes and the fold reads exactly this plane; a
+        // placeholder-shaped tensor would make either side run off its rows.
+        const auto *slotShape = context->GetOutputShape(OUTPUT_PARTIALS);
+        OP_CHECK_NULL_WITH_CONTEXT(context, slotShape);
+        const gert::Shape &slots = slotShape->GetOriginShape();
+        OP_CHECK_IF(slots.GetDimNum() != 3U || slots.GetDim(0) != heads ||
+                        slots.GetDim(1) != chunkNum ||
+                        slots.GetDim(2) != KDA::KDA_GATE_POST_SLOT_FLOATS,
+                    OP_LOGE(context->GetNodeName(),
+                            "split-reduce partials must be [heads, chunkNum, %d]",
+                            KDA::KDA_GATE_POST_SLOT_FLOATS),
+                    return ge::GRAPH_FAILED);
+    }
     tiling->batch = static_cast<int32_t>(batch);
     tiling->seqlen = static_cast<int32_t>(seqlen);
     tiling->headNum = static_cast<int32_t>(heads);
@@ -541,12 +605,18 @@ ge::graphStatus Tiling4KdaGateBwdPost(gert::TilingContext *context)
     tiling->chunkSize = static_cast<int32_t>(*chunkSize);
     tiling->chunkNum = static_cast<int32_t>(chunkNum);
     tiling->chunkNumPerBatch = static_cast<int32_t>(chunkNumPerBatch);
-    tiling->usedCoreNum = static_cast<int32_t>(usedCoreNum);
+    // The produce launch runs one core per (head, part); the fold launch only
+    // walks heads, so it keeps one core per head and never needs the shard
+    // geometry.
+    tiling->usedCoreNum = static_cast<int32_t>(
+        splitMode == 1 ? splitUsedCoreNum : usedCoreNum);
     tiling->isVarLen = isVarLen ? 1 : 0;
     tiling->hasDtBias =
         context->GetOptionalInputShape(INPUT_DT_BIAS) != nullptr ? 1 : 0;
     tiling->inputScanned = *inputScanned ? 1 : 0;
-    tiling->reserved1 = 0;
+    tiling->splitMode = static_cast<int8_t>(splitMode);
+    tiling->splitParts = static_cast<int32_t>(splitParts);
+    tiling->chunksPerPart = static_cast<int32_t>(chunksPerPart);
     tiling->lowerBound = *lowerBound;
     if (isVarLen) {
         const auto *cuTensor =
@@ -590,7 +660,8 @@ ge::graphStatus Tiling4KdaGateBwdPost(gert::TilingContext *context)
                     return ge::GRAPH_FAILED);
     }
 
-    context->SetBlockDim(usedCoreNum);
+    context->SetBlockDim(
+        splitMode == 1 ? splitUsedCoreNum : usedCoreNum);
     // Task decoding and token addressing use tiling.isVarLen at runtime.
     // Reuse the same device specialization for dense and packed layouts so
     // the proven A5 reverse-scan pipeline is compiled only once.

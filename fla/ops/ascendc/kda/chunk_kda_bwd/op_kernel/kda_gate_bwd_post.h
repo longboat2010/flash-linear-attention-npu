@@ -404,13 +404,25 @@ template <bool SAFE_GATE, typename RawGateT, bool VARLEN_TND>
 class KdaGateBwdPostKernel {
 public:
     static constexpr uint32_t kKeyDim = 128;
+    // Split-reduce fold: slots consumed per MTE2 batch when folding the
+    // per-(head, chunk) partials into the final dA/dBias.
+    static constexpr uint32_t kFoldBatchSlots = 8;
+    // Fold stage layout, in 32-bit words: one batch of payloads packed at
+    // KDA_GATE_POST_PAYLOAD_FLOATS each.
+    static constexpr uint32_t kFoldPayloadWords =
+        static_cast<uint32_t>(KDA_GATE_POST_PAYLOAD_FLOATS);
+    static constexpr uint32_t kFoldStageWords =
+        kFoldBatchSlots * kFoldPayloadWords;
     static constexpr uint32_t kChunkRows = 64;
     static constexpr uint32_t kChunkBytes =
         kChunkRows * kKeyDim * sizeof(float);
     static constexpr uint32_t kRowBytes =
         kKeyDim * sizeof(float);
     static constexpr uint32_t kWorkBytes = 4 * kRowBytes;
-    static_assert(4 * kChunkBytes + 4 * 1024 + 32 <= 192 * 1024,
+    static_assert(4 * kChunkBytes + 4 * 1024 + 32 +
+                          kFoldStageWords * sizeof(int32_t) +
+                          KDA_GATE_POST_SLOT_FLOATS * sizeof(float) <=
+                      192 * 1024,
                   "KdaGateBwdPost exceeds the 192 KiB UB budget");
 
     __aicore__ inline void Init(
@@ -435,7 +447,9 @@ public:
         // every invocation must perform the reverse cumsum before applying
         // the raw-gate chain rule.
         tiling_.inputScanned = 0;
-        tiling_.reserved1 = tiling.reserved1;
+        tiling_.splitMode = tiling.splitMode;
+        tiling_.splitParts = tiling.splitParts;
+        tiling_.chunksPerPart = tiling.chunksPerPart;
         tiling_.lowerBound = tiling.lowerBound;
         // The kernel entry owns exactly one TPipe.  Reuse it for every
         // TBuf/TQue, matching the mature pure-AIV gate-cumsum operator.
@@ -475,10 +489,18 @@ public:
         }
         pipe_->InitBuffer(reduce_, 4 * 1024);
         pipe_->InitBuffer(metadata_, 32);
+        // Split-reduce fold scratch: one MTE2 stage of kFoldBatchSlots
+        // payloads, plus a KDA_GATE_POST_SLOT_FLOATS float accumulator
+        // (dbias[128] | dA[8]).
+        pipe_->InitBuffer(foldStage_, kFoldStageWords * sizeof(int32_t));
+        pipe_->InitBuffer(
+            foldAcc_,
+            static_cast<uint32_t>(KDA_GATE_POST_SLOT_FLOATS) * sizeof(float));
         vToMte3_ = pipe_->AllocEventID<AscendC::HardEvent::V_MTE3>();
         mte3ToV_ = pipe_->AllocEventID<AscendC::HardEvent::MTE3_V>();
         mte3ToMte2_ =
             pipe_->AllocEventID<AscendC::HardEvent::MTE3_MTE2>();
+        vToMte2_ = pipe_->AllocEventID<AscendC::HardEvent::V_MTE2>();
         initMte2ToV_ =
             pipe_->AllocEventID<AscendC::HardEvent::MTE2_V>();
         rawMte2ToV_ =
@@ -487,17 +509,66 @@ public:
         scalarSToV_ = pipe_->AllocEventID<AscendC::HardEvent::S_V>();
     }
 
+    __aicore__ inline void SetPartialSlots(GM_ADDR partials)
+    {
+        // Split-reduce only: per-(head, chunk) fp32 reduction slots written by
+        // the produce launch and consumed by the fold launch of this op.
+        // Never set on the legacy path.
+        partialSlotsGm_.SetGlobalBuffer(
+            reinterpret_cast<__gm__ float *>(partials));
+    }
+
     __aicore__ inline void Process()
     {
         const uint32_t core = AscendC::GetBlockIdx();
-        for (uint32_t head = core;
-             head < static_cast<uint32_t>(tiling_.headNum);
-             head += static_cast<uint32_t>(tiling_.usedCoreNum)) {
-            ProcessHead(head);
+        if (tiling_.splitMode == 1) {
+            // Split-reduce, produce launch: each core owns (head, part) tasks
+            // and stores the per-chunk partial reduction into its slots.  The
+            // fold is a separate launch, ordered by the launch boundary.
+            const uint32_t taskCount =
+                static_cast<uint32_t>(tiling_.headNum) *
+                static_cast<uint32_t>(tiling_.splitParts);
+            for (uint32_t task = core; task < taskCount;
+                 task += static_cast<uint32_t>(tiling_.usedCoreNum)) {
+                const uint32_t head = task /
+                    static_cast<uint32_t>(tiling_.splitParts);
+                const uint32_t part = task %
+                    static_cast<uint32_t>(tiling_.splitParts);
+                const uint32_t chunkBegin = part *
+                    static_cast<uint32_t>(tiling_.chunksPerPart);
+                const uint32_t chunkEnd0 = chunkBegin +
+                    static_cast<uint32_t>(tiling_.chunksPerPart);
+                const uint32_t chunkEnd =
+                    chunkEnd0 < static_cast<uint32_t>(tiling_.chunkNum)
+                    ? chunkEnd0
+                    : static_cast<uint32_t>(tiling_.chunkNum);
+                ProcessHeadShard(head, chunkBegin, chunkEnd);
+            }
+            FlushSlotPayloads();
+        } else if (tiling_.splitMode == 2) {
+            // Split-reduce, fold launch: one core per head folds that head's
+            // slots in ascending chunk order, reproducing the serial fold
+            // below bit for bit.
+            for (uint32_t head = core;
+                 head < static_cast<uint32_t>(tiling_.headNum);
+                 head += static_cast<uint32_t>(tiling_.usedCoreNum)) {
+                FoldHeadSlots(head);
+            }
+        } else if (tiling_.splitMode == 3) {
+            // The tiling degenerated the split to a single part, so the
+            // produce launch ran the legacy path and already wrote the final
+            // dA/dBias; there is nothing to fold.
+        } else {
+            for (uint32_t head = core;
+                 head < static_cast<uint32_t>(tiling_.headNum);
+                 head += static_cast<uint32_t>(tiling_.usedCoreNum)) {
+                ProcessHead(head);
+            }
         }
         pipe_->ReleaseEventID<AscendC::HardEvent::V_MTE3>(vToMte3_);
         pipe_->ReleaseEventID<AscendC::HardEvent::MTE3_V>(mte3ToV_);
         pipe_->ReleaseEventID<AscendC::HardEvent::MTE3_MTE2>(mte3ToMte2_);
+        pipe_->ReleaseEventID<AscendC::HardEvent::V_MTE2>(vToMte2_);
         pipe_->ReleaseEventID<AscendC::HardEvent::MTE2_V>(initMte2ToV_);
         pipe_->ReleaseEventID<AscendC::HardEvent::MTE2_V>(rawMte2ToV_);
         pipe_->ReleaseEventID<AscendC::HardEvent::V_S>(scalarVToS_);
@@ -566,14 +637,14 @@ private:
                     tiling_.seqlen + token) * kKeyDim;
     }
 
-    __aicore__ inline void ProcessHead(uint32_t head)
+    // Load this head's gate parameters into the reduce_ scratch and return
+    // exp(A_log): dt_bias lands at reduce_[144] (the caller's bias tensor) and
+    // the aLog scalar at reduce_[272].  Shared by the legacy per-head walk and
+    // the split-reduce shard walk.
+    __aicore__ inline float LoadHeadGating(
+        uint32_t head, AscendC::LocalTensor<float> bias)
     {
-        auto dbAcc = reduce_.Get<float>();
-        auto dAAcc = dbAcc[kKeyDim];
-        auto scalar = reduce_.Get<float>()[136];
-        auto bias = reduce_.Get<float>()[144];
-        AscendC::Duplicate(dbAcc, 0.0f, kKeyDim);
-        AscendC::Duplicate(dAAcc, 0.0f, 8);
+        auto scalar = reduce_.Get<float>()[272];
         AscendC::DataCopyPad(
             scalar, aLogGm_[head],
             {1, static_cast<uint32_t>(sizeof(float)), 0, 0, 0},
@@ -587,7 +658,23 @@ private:
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(initMte2ToV_);
         AscendC::Exp(scalar, scalar, 1);
         AscendC::PipeBarrier<PIPE_V>();
-        const float expA = ReadScalar(scalar);
+        return ReadScalar(scalar);
+    }
+
+    __aicore__ inline void ProcessHead(uint32_t head)
+    {
+        auto dbAcc = reduce_.Get<float>();
+        auto dAAcc = dbAcc[kKeyDim];
+        // reduce_ layout (floats): the chunk accumulator [0..135] on the
+        // split path (dbias[128] | dA[8], copied into a slot at stride
+        // KDA_GATE_POST_SLOT_FLOATS), dt_bias at [144..271] (original spot),
+        // the aLog scalar at [272] (moved out of the accumulator's range; 32B
+        // aligned, and clear of the SAFE tile pipeline's partial/rowSum
+        // scratch at [280..855]).
+        auto bias = reduce_.Get<float>()[144];
+        AscendC::Duplicate(dbAcc, 0.0f, kKeyDim);
+        AscendC::Duplicate(dAAcc, 0.0f, 8);
+        const float expA = LoadHeadGating(head, bias);
 
         // For varlen, chunkNum is the number of chunk_indices entries,
         // i.e. sum_i ceil(sequence_length_i / C).  It is not generally equal
@@ -615,6 +702,125 @@ private:
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(mte3ToV_);
     }
 
+    // Fold this core's heads' per-chunk slots into the final dA/dBias with
+    // the same ascending fp32 addition sequence as the serial path, so the
+    // results stay bitwise identical to the single-core accumulation.
+    __aicore__ inline void FoldHeadSlots(uint32_t head)
+    {
+        auto acc = foldAcc_.Get<float>();
+        auto dAcc = acc[kKeyDim];
+        auto stage = foldStage_.Get<float>();
+        AscendC::Duplicate(
+            acc, 0.0f, static_cast<uint32_t>(KDA_GATE_POST_SLOT_FLOATS));
+        AscendC::PipeBarrier<PIPE_V>();
+        const uint64_t headBase =
+            static_cast<uint64_t>(head) *
+            static_cast<uint64_t>(tiling_.chunkNum) *
+            KDA_GATE_POST_SLOT_FLOATS;
+        const uint32_t chunkCount =
+            static_cast<uint32_t>(tiling_.chunkNum);
+        for (uint32_t base = 0; base < chunkCount; base += kFoldBatchSlots) {
+            const uint32_t count = base + kFoldBatchSlots <= chunkCount
+                ? kFoldBatchSlots
+                : chunkCount - base;
+            // Slots are contiguous in GM, so a whole batch is one MTE2 copy.
+            AscendC::DataCopy(
+                stage,
+                partialSlotsGm_[headBase +
+                                static_cast<uint64_t>(base) *
+                                    KDA_GATE_POST_SLOT_FLOATS],
+                count * kFoldPayloadWords);
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(rawMte2ToV_);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(rawMte2ToV_);
+            for (uint32_t i = 0; i < count; ++i) {
+                const uint32_t slotBase = i * kFoldPayloadWords;
+                AscendC::Add(acc, acc, stage[slotBase], kKeyDim);
+                AscendC::Add(dAcc, dAcc, stage[slotBase + kKeyDim], 1);
+                // Load-bearing, not a same-pipe formality: dropping it
+                // corrupts dA deterministically (910_93, values off by up to
+                // 1e16) while dbias stays bitwise, so the narrow dA Add is
+                // not ordered against the next iteration's read of acc.
+                AscendC::PipeBarrier<PIPE_V>();
+            }
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(vToMte2_);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(vToMte2_);
+        }
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(vToMte3_);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(vToMte3_);
+        AscendC::DataCopyPad(
+            dAGm_[head], dAcc,
+            {1, static_cast<uint32_t>(sizeof(float)), 0, 0, 0});
+        if (tiling_.hasDtBias != 0) {
+            AscendC::DataCopy(
+                dBiasGm_[static_cast<uint64_t>(head) * kKeyDim], acc,
+                kKeyDim);
+        }
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(mte3ToV_);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(mte3ToV_);
+    }
+
+    __aicore__ inline void ProcessHeadShard(
+        uint32_t head, uint32_t chunkBegin, uint32_t chunkEnd)
+    {
+        if (chunkBegin >= chunkEnd) {
+            return;
+        }
+        auto dbAcc = reduce_.Get<float>();
+        auto dAAcc = dbAcc[kKeyDim];
+        // Same reduce_ layout as ProcessHead.
+        auto bias = reduce_.Get<float>()[144];
+        const float expA = LoadHeadGating(head, bias);
+
+        for (uint32_t chunkIdx = chunkBegin; chunkIdx < chunkEnd;
+             ++chunkIdx) {
+            const GatePostChunkTask task = DecodeTask(chunkIdx);
+            AscendC::Duplicate(dbAcc, 0.0f, kKeyDim);
+            AscendC::Duplicate(dAAcc, 0.0f, 8);
+            ProcessChunk(task, head, expA, dbAcc, dAAcc, bias);
+            StoreSlot(head, chunkIdx, dbAcc);
+        }
+    }
+
+    __aicore__ inline void StoreSlot(
+        uint32_t head, uint32_t chunkIdx,
+        AscendC::LocalTensor<float> dbAcc)
+    {
+        // One slot is KDA_GATE_POST_PAYLOAD_FLOATS of payload (128 dbias +
+        // 8 dA, dA[0] live), stored at the KDA_GATE_POST_SLOT_FLOATS stride.
+        // FlushSlotPayloads() runs once per core after this loop, and the fold
+        // launch starts only after this entire launch has retired.
+        const uint64_t slotOffset =
+            (static_cast<uint64_t>(head) *
+                 static_cast<uint64_t>(tiling_.chunkNum) +
+             chunkIdx) * KDA_GATE_POST_SLOT_FLOATS;
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(vToMte3_);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(vToMte3_);
+        AscendC::DataCopy(
+            partialSlotsGm_[slotOffset], dbAcc,
+            static_cast<uint32_t>(KDA_GATE_POST_PAYLOAD_FLOATS));
+        // Retire the copy before the next chunk reuses dbAcc.  The next writer
+        // is the vector engine (the per-chunk Duplicate/Add/Cast chain inside
+        // ProcessChunk), so the dependency to hold is MTE3 -> V; an
+        // MTE3 -> MTE2 fence leaves the vector stores free to run into this
+        // copy's source read.
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(mte3ToV_);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(mte3ToV_);
+    }
+
+    // Push this core's slot payloads out of the store path/L2 into DDR so the
+    // launch boundary really does hand finished data to the fold: an MTE3 copy
+    // can retire on this core with its write still in flight in the cache
+    // hierarchy.  The same reinforcement chunk_kda_fwd_prepare_vec.h applies
+    // before it hands a workspace region to another core.
+    __aicore__ inline void FlushSlotPayloads()
+    {
+        // Clean (write back) this core's dirty lines for the slot plane; DSB
+        // then waits until those writes are ordered with respect to DDR.
+        AscendC::DataCacheCleanAndInvalid<
+            float, AscendC::CacheLine::ENTIRE_DATA_CACHE,
+            AscendC::DcciDst::CACHELINE_OUT>(partialSlotsGm_);
+        AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+    }
     __aicore__ inline void ProcessChunk(
         const GatePostChunkTask &task, uint32_t head, float expA,
         AscendC::LocalTensor<float> dbAcc,
@@ -1156,6 +1362,7 @@ private:
     AscendC::GlobalTensor<float> dgGm_;
     AscendC::GlobalTensor<float> dAGm_;
     AscendC::GlobalTensor<float> dBiasGm_;
+    AscendC::GlobalTensor<float> partialSlotsGm_;
     AscendC::TQue<AscendC::TPosition::VECIN, 1> upstreamQueue_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> scanPing_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> scanPong_;
@@ -1163,9 +1370,12 @@ private:
     AscendC::TBuf<AscendC::TPosition::VECCALC> result_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> reduce_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> metadata_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> foldStage_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> foldAcc_;
     AscendC::TEventID vToMte3_;
     AscendC::TEventID mte3ToV_;
     AscendC::TEventID mte3ToMte2_;
+    AscendC::TEventID vToMte2_;
     AscendC::TEventID initMte2ToV_;
     AscendC::TEventID rawMte2ToV_;
     AscendC::TEventID scalarVToS_;
