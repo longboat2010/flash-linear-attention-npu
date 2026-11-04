@@ -2159,9 +2159,11 @@ def npu_chunk_kda_bwd(q, k, v, beta, gk, Aqk, Akk, w, qg, kg, v_new, h, d_o,
         # Dense calls have no sequence metadata, including after tail padding.
         indices = None if cu is None else _canonical_chunk_indices(cu, chunk_size)
 
-    # A2's fused Intra pipeline processes heads in pairs; a lone final head can
-    # keep a stale correction from the previous launch.
-    padded_head = bool(heads % 2 != 0 and is_a2_device)
+    # A2/A3's fused Intra pipeline processes heads in pairs; a lone final head can
+    # keep a stale correction from the previous launch. 910_93 (A3) must pad too:
+    # main carries no kernel-side odd-head scratch zeroing, so this wrapper guard
+    # is the only protection (flashserve issue #874).
+    padded_head = bool(heads % 2 != 0 and (is_a2_device or is_a3_device))
     if padded_head:
         head_dim = 0 if is_varlen else 1
 
