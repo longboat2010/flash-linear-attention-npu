@@ -34,11 +34,18 @@ public:
             .DataType(fp32).Format(nd).UnknownShapeFormat(nd);
         this->Output("dbias").ParamType(REQUIRED)
             .DataType(fp32).Format(nd).UnknownShapeFormat(nd);
+        // Split-reduce scratch: [heads, chunks, 136] FP32 slots.  Non-split
+        // launches get a one-element placeholder the kernel never touches.
+        this->Output("partials").ParamType(OPTIONAL)
+            .DataType(fp32).Format(nd).UnknownShapeFormat(nd);
 
         this->Attr("chunk_size").AttrType(REQUIRED).Int(64);
         this->Attr("safe_gate").AttrType(REQUIRED).Bool(true);
         this->Attr("lower_bound").AttrType(REQUIRED).Float(-5.0f);
         this->Attr("input_scanned").AttrType(REQUIRED).Bool(false);
+        // Phase of one split-reduce call: 0 = single launch, 1 = produce,
+        // 2 = fold, 3 = no-op fold (the split degenerated to one part).
+        this->Attr("split_reduce").AttrType(REQUIRED).Int(0);
 
         OpAICoreConfig config;
         config.DynamicCompileStaticFlag(true)

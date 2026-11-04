@@ -6,14 +6,14 @@ constexpr bool kKdaGatePostCompileTimeVarlen = true;
 extern "C" __global__ __aicore__ void kda_gate_bwd_post_varlen(
     GM_ADDR dg_act, GM_ADDR raw_g, GM_ADDR a_log, GM_ADDR dt_bias,
     GM_ADDR cu_seqlens, GM_ADDR chunk_indices, GM_ADDR dg, GM_ADDR dA,
-    GM_ADDR dbias, GM_ADDR workspace, GM_ADDR tiling)
+    GM_ADDR dbias, GM_ADDR partials, GM_ADDR workspace, GM_ADDR tiling)
 {
-    (void)workspace;
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     REGISTER_TILING_DEFAULT(KDA::KdaGateBwdPostTilingData);
     GET_TILING_DATA_WITH_STRUCT(
         KDA::KdaGateBwdPostTilingData, tilingData, tiling);
     AscendC::TPipe pipe;
+    (void)workspace;
 
 #define RUN_GATE_POST_VARLEN(SAFE)                                            \
     do {                                                                      \
@@ -21,6 +21,7 @@ extern "C" __global__ __aicore__ void kda_gate_bwd_post_varlen(
             SAFE, DTYPE_RAW_G, kKdaGatePostCompileTimeVarlen> process;        \
         process.Init(dg_act, raw_g, a_log, dt_bias, cu_seqlens,               \
                      chunk_indices, dg, dA, dbias, tilingData, &pipe);         \
+        process.SetPartialSlots(partials);                                     \
         process.Process();                                                     \
     } while (0)
 

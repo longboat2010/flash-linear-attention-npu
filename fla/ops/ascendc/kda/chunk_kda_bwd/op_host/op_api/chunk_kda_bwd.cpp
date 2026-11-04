@@ -3,8 +3,17 @@
 #include "opdev/make_op_executor.h"
 #include "opdev/op_dfx.h"
 #include "opdev/op_log.h"
+#include "opdev/platform.h"
 #include "acl/acl_base_rt.h"
 #include <string>
+
+// Single source of truth for the split-reduce slot layout.  The op_kernel
+// header only depends on <cstdint>, so the opapi translation unit includes it
+// by relative path; do not re-mirror the stride here.  A stale mirror would
+// make the slot plane the wrong size and the fold would read past its rows.
+#include "../../op_kernel/kda_gate_bwd_post_common.h"
+
+using KDA::KDA_GATE_POST_SLOT_FLOATS;
 
 using namespace op;
 
@@ -74,12 +83,76 @@ ChunkKdaBwdOutputs ChunkKdaBwd(
     }
     if (deferGatePost) {
         if (cuSeqlensOptional != nullptr) {
+            // Split-reduce: fan the per-chunk reduction over (head, part)
+            // tasks into a slot plane in one launch, then fold the slots in a
+            // second launch of this same op, ordered by the launch boundary.
+            // The split is skipped for a non-rank-3 raw gate, on A5 (DAV_3510)
+            // and when the slot allocation fails; each of those runs the
+            // legacy single launch instead.
+            const bool splitArchOk =
+                op::GetCurrentPlatformInfo().GetCurNpuArch() !=
+                NpuArch::DAV_3510;
+            bool splitReduce =
+                splitArchOk && safeGate &&
+                rawGOptional != nullptr &&
+                rawGOptional->GetViewShape().GetDimNum() == 3;
+            // Always hand the kernel a real slot plane: this launcher takes no
+            // null OPTIONAL output, and aliasing dg would let any future slot
+            // write corrupt dg.  The legacy arm gets a one-element placeholder
+            // that the kernel never touches.
+            op::Shape slotShape;
+            if (splitReduce) {
+                slotShape.AppendDim(
+                    rawGOptional->GetViewShape().GetDim(0));
+                slotShape.AppendDim(
+                    chunkIndicesOptional->GetViewShape().GetShapeSize() / 2);
+                slotShape.AppendDim(KDA_GATE_POST_SLOT_FLOATS);
+            } else {
+                slotShape.AppendDim(1);
+            }
+            const aclTensor *partials = executor->AllocTensor(
+                slotShape, DataType::DT_FLOAT, Format::FORMAT_ND);
+            if (partials == nullptr && splitReduce) {
+                // The legacy launch needs no slots, so a failed slot
+                // allocation costs the split only, not the result.
+                OP_LOGW("Gate post split slot allocation failed; using the "
+                        "single legacy launch.");
+                splitReduce = false;
+                op::Shape placeholder;
+                placeholder.AppendDim(1);
+                partials = executor->AllocTensor(
+                    placeholder, DataType::DT_FLOAT, Format::FORMAT_ND);
+            }
+            if (partials == nullptr) {
+                OP_LOGE(ACLNN_ERR_INNER_NULLPTR,
+                        "AllocTensor for gate post slots failed.");
+                return {};
+            }
+            // Phase 1 writes the plane and phase 2 reads it; both launch with
+            // the same tensor, which is what carries the partials across.
+            const int64_t splitMode = splitReduce ? 1 : 0;
             ret = ADD_TO_LAUNCHER_LIST_AICORE(
                 KdaGateBwdPostVarlen,
                 OP_INPUT(dgBase, rawGOptional, aLogOptional, dtBiasOptional,
                          cuSeqlensOptional, chunkIndicesOptional),
-                OP_OUTPUT(dg, dAOptional, dBiasOptional),
-                OP_ATTR(chunkSize, safeGate, lowerBound, false));
+                OP_OUTPUT(dg, dAOptional, dBiasOptional, partials),
+                OP_ATTR(chunkSize, safeGate, lowerBound, false, splitMode));
+            if (ret != ACLNN_SUCCESS) {
+                OP_LOGE(ACLNN_ERR_PARAM_INVALID,
+                        "ADD_TO_LAUNCHER_LIST_AICORE GatePost produce failed.");
+                return {};
+            }
+            if (splitReduce) {
+                ret = ADD_TO_LAUNCHER_LIST_AICORE(
+                    KdaGateBwdPostVarlen,
+                    OP_INPUT(dgBase, rawGOptional, aLogOptional,
+                             dtBiasOptional, cuSeqlensOptional,
+                             chunkIndicesOptional),
+                    OP_OUTPUT(dg, dAOptional, dBiasOptional, partials),
+                    OP_ATTR(chunkSize, safeGate, lowerBound, false,
+                            static_cast<int64_t>(2)));
+                // A fold failure is reported by the shared check below.
+            }
         } else {
             ret = ADD_TO_LAUNCHER_LIST_AICORE(
                 KdaGateBwdPost,
