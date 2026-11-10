@@ -567,58 +567,38 @@ def stream_probe(device_index: int) -> tuple[int, int]:
 
 
 def npu_recurrent_gated_delta_rule(
-    query,
-    key,
-    value,
-    state,
-    *,
-    beta,
-    scale=1.0,
-    actual_seq_lengths,
-    ssm_state_indices,
-    num_accepted_tokens=None,
-    g=None,
-    gk=None,
+    query, key, value, state, *, beta, scale=1.0, actual_seq_lengths,
+    ssm_state_indices, num_accepted_tokens=None, g=None, gk=None,
+    use_qk_l2norm_in_kernel=False, use_gate_in_kernel=False, A_log=None,
+    dt_bias=None, use_beta_sigmoid_in_kernel=False, allow_neg_eigval=False,
 ):
-    """Recurrent GDN forward; mutates ``state`` in place like the other paths."""
+    """Route every supported call to the fused RecurrentGDN implementation.
 
-    # The reference refuses a call that supplies neither gate; the kernel does
-    # not.  Measured on 910B3: without this check the launcher returned the
-    # ungated result instead of raising -- exactly the failure mode this path
-    # must not have, i.e. silently different numbers rather than an error.  Same
-    # shape as the use_exp2 refusal repeated in npu_chunk_gated_delta_rule_bwd.
-    if g is None and gk is None:
-        raise RuntimeError(
-            "npu_recurrent_gated_delta_rule: either g or gk must be provided.")
+    Fusion flags select arithmetic only; disabling them never selects the
+    historical kernel. The two ACLNN host ABIs share arch22 on A2/A3.
+    """
+    if gk is not None:
+        raise ValueError("gk is reserved; only scalar gate g is supported.")
+    from ._recurrent_gdn import validate_recurrent_gdn
 
-    # Hot path: a decode step walks this operator some thirty times, so it is
-    # written without helper calls and reads the op cache directly (the first
-    # call is what loads the library).  See the note above `_INC_VERSION`.
-    if state is not None and state.requires_grad:
+    scale = validate_recurrent_gdn(query, key, value, state, beta=beta, scale=scale,
+        actual_seq_lengths=actual_seq_lengths, ssm_state_indices=ssm_state_indices,
+        num_accepted_tokens=num_accepted_tokens, g=g, gk=gk, A_log=A_log,
+        dt_bias=dt_bias, use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_gate_in_kernel=use_gate_in_kernel,
+        use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+        allow_neg_eigval=allow_neg_eigval)
+    if state.requires_grad:
         _refuse_grad_state("npu_recurrent_gated_delta_rule", state)
-    stream = _current_stream_ptr()
-    op = _OP_CACHE.get("npu_recurrent_gated_delta_rule")
-    if op is None:
-        op = _op("npu_recurrent_gated_delta_rule")
-    result = op(
-        query,
-        key,
-        value,
-        state,
-        beta,
-        actual_seq_lengths,
-        ssm_state_indices,
-        num_accepted_tokens,
-        g,
-        gk,
-        float(scale),
-        stream,
-    )
-    if state is not None:
-        bump = _INC_VERSION
-        if bump is None:
-            bump = _increment_version()
-        bump((state,))
+    result = _op("npu_recurrent_gated_delta_rule")(
+        query, key, value, state, beta, actual_seq_lengths, ssm_state_indices,
+        num_accepted_tokens, g, gk, A_log, dt_bias, scale,
+        use_qk_l2norm_in_kernel, use_gate_in_kernel,
+        use_beta_sigmoid_in_kernel, allow_neg_eigval, _current_stream_ptr())
+    bump = _INC_VERSION
+    if bump is None:
+        bump = _increment_version()
+    bump((state,))
     return result
 
 
@@ -650,45 +630,18 @@ def npu_recurrent_kda(
     """Recurrent KDA forward via the Stable-ABI launcher.
 
     ``layout`` is mapped to an int code (BSND=0, TND=1) because the stable
-    argument conversions do not carry strings.  Mutates ``initial_state`` in
-    place when ``inplace_final_state`` is true.
+    argument conversions do not carry strings. Non-inplace calls read the
+    input state and return a separate pool when ``output_final_state`` is true.
     """
 
     layout_code = _char_code("npu_recurrent_kda", "layout", layout)
 
-    # The contract only covers the in-place form: with
-    # `inplace_final_state=False` the caller's tensor is not written (the
-    # recursion below runs the kernel on a scratch state instead), which is the
-    # same split the dispatch layer's MUTATION_FLAGS entry declares.
-    if (inplace_final_state and initial_state is not None
-            and initial_state.requires_grad):
-        _refuse_grad_state("npu_recurrent_kda", initial_state)
-    if not inplace_final_state:
-        # Run the same kernel with a scratch state and return it, leaving the
-        # caller's tensor untouched. The stable launcher only
-        # exposes the inplace form (handing the caller's handle back as a second
-        # output trips over shared ownership), so build the scratch here -- which
-        # is also what keeps the mutation contract honest: the caller's tensor is
-        # genuinely not written, and the dispatch layer's MUTATION_FLAGS entry
-        # already skips the version bump for this case.
-        if initial_state is None:
-            raise RuntimeError(
-                "npu_recurrent_kda: inplace_final_state=False requires "
-                "initial_state (no shape to build the scratch from)")
-        import torch
-
-        scratch = torch.empty_like(initial_state)
-        out, _ = npu_recurrent_kda(
-            q, k, v, g, beta, scratch, cu_seqlens=cu_seqlens,
-            ssm_state_indices=ssm_state_indices, A_log=A_log, dt_bias=dt_bias,
-            num_accepted_tokens=num_accepted_tokens, layout=layout, scale=scale,
-            output_final_state=False, inplace_final_state=True,
-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-            use_gate_in_kernel=use_gate_in_kernel,
-            use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
-            allow_neg_eigval=allow_neg_eigval, safe_gate=safe_gate,
-            lower_bound=lower_bound, state_v_first=state_v_first)
-        return out, (scratch if output_final_state else None)
+    if initial_state is None:
+        raise RuntimeError("npu_recurrent_kda: initial_state must not be None")
+    if initial_state.requires_grad:
+        if inplace_final_state:
+            _refuse_grad_state("npu_recurrent_kda", initial_state)
+        initial_state = initial_state.detach()
 
     scale_value = (128.0 ** -0.5) if scale is None else float(scale)
     lower = -5.0 if lower_bound is None else float(lower_bound)
@@ -722,19 +675,13 @@ def npu_recurrent_kda(
         bool(state_v_first),
         stream,
     )
-    if not output_final_state:
-        final_state = None
-    elif inplace_final_state and final_state is None:
-        # The launcher returns the inplace result implicitly (the kernel writes
-        # the caller's tensor); the stable ABI cannot hand that handle back as a
-        # second output without a double ownership release, so return the
-        # caller's object here.
-        final_state = initial_state
-    if initial_state is not None:
+    if inplace_final_state and initial_state is not None:
         bump = _INC_VERSION
         if bump is None:
             bump = _increment_version()
         bump((initial_state,))
+    if inplace_final_state and output_final_state:
+        final_state = initial_state
     return out, final_state
 
 
@@ -1762,16 +1709,39 @@ def npu_chunk_gated_delta_rule_fwd(q, k, v, g, beta, *, initial_state=None,
                                    dt_bias=None, layout="BNSD"):
     """Fused GDN forward: `o` plus the intermediates the backward consumes.
 
-    The tuple is fixed at ten slots -- `(o, final_state, g_cumsum, A, beta_eff,
-    h, q_hat, k_hat, q_rstd, k_rstd)` -- carrying `None` in the slots the flags
-    switch off, exactly like the reference.  `q_hat`/`k_hat` are the caller's
-    own q/k when the kernel is not asked to normalise them.
+    ``disable_recompute`` gates g_cumsum, A and the q/k hats. ``False`` leaves
+    those slots None; the kernel still normalises when asked. ``True`` exports
+    g_cumsum and A. q_hat and k_hat are allocated when the kernel normalises,
+    and are the caller's own q/k when chunk 64/128 leaves normalisation off.
+
+    ``h`` follows ``return_intermediate_states``. ``beta_eff`` follows
+    ``use_beta_sigmoid_in_kernel``. Neither waits on ``disable_recompute``.
+
+    Chunk 32 runs L2 and beta sigmoid inside the kernel. It requires
+    ``use_exp2=False``, ``use_qk_l2norm_in_kernel=True`` and
+    ``use_beta_sigmoid_in_kernel=True``, so ``beta_eff`` is always returned.
     """
 
     # Gate-in-kernel is unsupported by this kernel build, and the reference
     # refuses the flag together with a_log/dt_bias before the launch.  Dropping
     # them here instead would turn a rejected call into a silently different
     # one, so the refusal is repeated.
+    if int(chunk_size) == 32:
+        if (bool(use_exp2) or not bool(use_qk_l2norm_in_kernel)
+                or not bool(use_beta_sigmoid_in_kernel)):
+            raise RuntimeError(
+                "npu_chunk_gated_delta_rule_fwd: chunk_size=32 requires "
+                "use_exp2=False, use_qk_l2norm_in_kernel=True and "
+                "use_beta_sigmoid_in_kernel=True.")
+        if int(v.shape[-1]) != 128:
+            raise RuntimeError(
+                "npu_chunk_gated_delta_rule_fwd: chunk_size=32 requires V=128.")
+        torch = _modules()[0]
+        if initial_state is not None and initial_state.dtype not in (
+                torch.bfloat16, torch.float32):
+            raise RuntimeError(
+                "npu_chunk_gated_delta_rule_fwd: chunk_size=32 initial_state "
+                "must be bfloat16 or float32.")
     if use_gate_in_kernel:
         raise RuntimeError(
             "npu_chunk_gated_delta_rule_fwd: use_gate_in_kernel=True is not "
