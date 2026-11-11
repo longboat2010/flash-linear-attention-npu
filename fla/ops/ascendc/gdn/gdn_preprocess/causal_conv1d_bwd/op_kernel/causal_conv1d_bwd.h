@@ -167,6 +167,18 @@ private:
     uint32_t BT_ = 0, BD_ = 0;
     uint32_t numBlksD_ = 0, numChunks_ = 0;
     uint32_t chunkPerCore_ = 0, tailChunk_ = 0;
+    // Sequential chunk->segment resolution cache for ResolveChunk (see its
+    // comment). chunkIdx is monotonically non-decreasing across the current +
+    // prefetch calls inside one i_d run and restarts from the core's first
+    // chunk on every i_d iteration, so the cache resets on backward jumps and
+    // each segment is visited once per run instead of once per chunk.
+    uint32_t resolveSeg_ = 0;
+    uint32_t resolveChunkBase_ = 0;
+    uint64_t resolveSegStart_ = 0;
+    uint32_t resolveSegLen_ = 0;
+    uint32_t resolveSegChunks_ = 0;
+    bool resolvePosValid_ = false;
+    bool resolveSegInfoValid_ = false;
     uint32_t btBdCount_ = 0, wBdCount_ = 0;
     uint32_t dyRows_ = 0, dyBdCount_ = 0;
 
@@ -1496,20 +1508,42 @@ __aicore__ inline bool CausalConv1dBwdKernel<inputT, calT>::ResolveChunk(
         return chunkIdx < CeilDiv(seqLen, BT_);
     }
 
-    uint32_t chunkBase = 0;
-    for (uint32_t seq = 0; seq < B_; seq++) {
-        int64_t start = queryStartLocGm_.GetValue(seq);
-        int64_t end = queryStartLocGm_.GetValue(seq + 1);
-        uint32_t curLen = static_cast<uint32_t>(end - start);
-        uint32_t curChunks = CeilDiv(curLen, BT_);
-        if (chunkIdx < chunkBase + curChunks) {
-            i_b = seq;
-            i_t = chunkIdx - chunkBase;
-            bos = static_cast<uint64_t>(start);
-            seqLen = curLen;
+    // ResolveChunk is called ~2x per chunk (current + prefetch) on
+    // monotonically non-decreasing chunk indices inside one i_d run, so the
+    // naive full scan below costs O(B) GM scalar reads per call and
+    // O(numChunks * B) per launch -- the dominant term once the packed batch
+    // holds thousands of segments. Keeping the scan position (segment index +
+    // chunk base + current segment's data) across calls makes the steady state
+    // zero-GM-read; a backward jump in chunkIdx (the i_d loop restarts from the
+    // core's first chunk) resets the scan to segment 0. Correctness only needs
+    // query_start_loc to stay constant for the whole launch -- the backward
+    // reset makes any call order safe; the monotone order above is the
+    // performance assumption Process documents at its call sites.
+    if (!resolvePosValid_ || chunkIdx < resolveChunkBase_) {
+        resolveSeg_ = 0;
+        resolveChunkBase_ = 0;
+        resolveSegInfoValid_ = false;
+        resolvePosValid_ = true;
+    }
+    while (resolveSeg_ < B_) {
+        if (!resolveSegInfoValid_) {
+            int64_t start = queryStartLocGm_.GetValue(resolveSeg_);
+            int64_t end = queryStartLocGm_.GetValue(resolveSeg_ + 1);
+            resolveSegStart_ = static_cast<uint64_t>(start);
+            resolveSegLen_ = static_cast<uint32_t>(end - start);
+            resolveSegChunks_ = CeilDiv(resolveSegLen_, BT_);
+            resolveSegInfoValid_ = true;
+        }
+        if (chunkIdx < resolveChunkBase_ + resolveSegChunks_) {
+            i_b = resolveSeg_;
+            i_t = chunkIdx - resolveChunkBase_;
+            bos = resolveSegStart_;
+            seqLen = resolveSegLen_;
             return true;
         }
-        chunkBase += curChunks;
+        resolveChunkBase_ += resolveSegChunks_;
+        resolveSeg_++;
+        resolveSegInfoValid_ = false;
     }
     return false;
 }
@@ -1609,6 +1643,15 @@ __aicore__ inline void CausalConv1dBwdKernel<inputT, calT>::Process()
         bool directVectorTilePrefetched = false;
         bool directVectorPrefetchedReuseHalo = false;
 
+        // Contract the ResolveChunk cached scan relies on: within one i_d run
+        // the chunk indices passed to ResolveChunk are monotonically
+        // non-decreasing (the current chunk, then its prefetch twin
+        // chunkIdx+1), and they restart from this core's first chunk on every
+        // i_d iteration. The `chunkIdx >= numChunks_` guard and the prefetch
+        // twin formula below are part of that contract -- keep them in sync
+        // when touching this loop. ResolveChunk's own correctness only needs
+        // query_start_loc to stay constant for the whole launch; the monotone
+        // order above is what keeps its scan cost O(1) per call.
         for (uint32_t loop = 0; loop < loopC; loop++) {
             uint32_t chunkIdx = (bIdx < tailChunk_)
                 ? (bIdx * (chunkPerCore_ + 1) + loop)
@@ -1635,6 +1678,8 @@ __aicore__ inline void CausalConv1dBwdKernel<inputT, calT>::Process()
 
                 directTilePrefetched = false;
                 if (loop + 1U < loopC) {
+                    // Prefetch twin: chunkIdx+1 of the same monotone run (see
+                    // the ResolveChunk cache contract above).
                     uint32_t nextChunkIdx = (bIdx < tailChunk_)
                         ? (bIdx * (chunkPerCore_ + 1) + loop + 1U)
                         : (bIdx * chunkPerCore_ + tailChunk_ + loop + 1U);
@@ -1664,6 +1709,8 @@ __aicore__ inline void CausalConv1dBwdKernel<inputT, calT>::Process()
 
                 directVectorTilePrefetched = false;
                 if (loop + 1U < loopC) {
+                    // Prefetch twin: chunkIdx+1 of the same monotone run (see
+                    // the ResolveChunk cache contract above).
                     uint32_t nextChunkIdx = (bIdx < tailChunk_)
                         ? (bIdx * (chunkPerCore_ + 1) + loop + 1U)
                         : (bIdx * chunkPerCore_ + tailChunk_ + loop + 1U);
