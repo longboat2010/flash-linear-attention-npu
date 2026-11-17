@@ -2641,6 +2641,12 @@ __aicore__ inline void CausalConv1dBwdKernel<inputT, calT>::Process()
         // when touching this loop. ResolveChunk's own correctness only needs
         // query_start_loc to stay constant for the whole launch; the monotone
         // order above is what keeps its scan cost O(1) per call.
+        // A6 (9201, inputStages=3) exception: the k=1..2 multi-slot prefetch
+        // issues ...,c+S-1,c+1,... -- no longer monotone, so segment-boundary
+        // lookups fall back to the cache's backward-jump reset and re-scan
+        // from segment 0. Correctness is unaffected; dense-short-segment A6
+        // shapes pay an O(segments) rescan per window (still better than the
+        // O(numChunks) naive scan).
         for (uint32_t loop = 0; loop < loopC; loop++) {
             uint32_t chunkIdx = (bIdx < tailChunk_)
                 ? (bIdx * (chunkPerCore_ + 1) + loop)

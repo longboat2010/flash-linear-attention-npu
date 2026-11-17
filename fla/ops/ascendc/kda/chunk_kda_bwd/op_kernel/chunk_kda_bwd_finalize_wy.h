@@ -893,7 +893,7 @@ public:
             // emitted only after BuildKE has completed its workspace store.
             // Consume it before launching zW, whose right operand is kE.
             WaitVectorStage(s0Consumed);
-#if !defined(__CCE_AICORE__) || __CCE_AICORE__ != 310
+#if !defined(__NPU_ARCH__) || (__NPU_ARCH__ != 3510)
             // S3b (and S5 below) re-read dW from GM with MTE2, but dW is the
             // fixpipe output of S3a just above, so a load that beats the write
             // reads the previous slot user's bytes and poisons
