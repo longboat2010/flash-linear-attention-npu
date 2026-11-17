@@ -13,7 +13,6 @@
 #include "catlass/arch/cross_core_sync.hpp"
 #include "catlass/arch/resource.hpp"
 #include "catlass/catlass.hpp"
-#include "catlass/debug.hpp"
 #include "../block/block_scheduler_gdn_fwd_h_preload.hpp"
 #include "catlass/epilogue/block/block_epilogue.hpp"
 #include "../../epilogue/block/block_epilogue_gdn_fwdh_update_preload.hpp"
@@ -322,7 +321,7 @@ public:
             {   
                 uint32_t batchIdx = initialStateBlockOffset / vNumHead;
                 uint32_t vHeadIdx = initialStateBlockOffset % vNumHead;
-                uint32_t chunkOffset = isVariedLen ? vecBlockScheduler.GetVarlenChunkOffset(batchIdx) : 0; 
+                uint32_t chunkOffset = isVariedLen ? vecBlockScheduler.GetVarlenChunkOffset(batchIdx) : 0;
                 uint64_t initialStateOffset = initialStateBlockOffset * stateBlockSize;
                 uint32_t shapeBatchIdx = isVariedLen ? 0 : batchIdx;
                 uint64_t hOffset = ((shapeBatchIdx * totalChunks + chunkOffset) * vNumHead + vHeadIdx) * stateBlockSize;
