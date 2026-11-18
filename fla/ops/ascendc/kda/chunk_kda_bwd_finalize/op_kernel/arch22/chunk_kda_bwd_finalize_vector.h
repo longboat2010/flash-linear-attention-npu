@@ -792,7 +792,16 @@ public:
                                  ROWS * CHUNK_SIZE);
                 }
                 AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Muls(value, value, matrix == 0 ? 65536.0f : -65536.0f, ROWS * CHUNK_SIZE);
+                // Production keeps the matrix at its true scale: the 65,536
+                // hi/lo magnification belongs to the CAPTURE snapshot format
+                // only.  Magnified, the cube GEMM's worst single product on a
+                // saturated safe-gate pack reaches 2^134.5 (dAqk 2^18 x 2^16 x
+                // band factor 2^107.6) and turns Inf; at true scale the same
+                // product is 2^118.5 and finite.  The headroom is
+                // data-dependent, not structural.
+                const float hiLoMag = CAPTURE ? 65536.0f : 1.0f;
+                AscendC::Muls(value, value, matrix == 0 ? hiLoMag : -hiLoMag,
+                              ROWS * CHUNK_SIZE);
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(outputFree_[outputSlot]);
                 AscendC::PipeBarrier<PIPE_V>();
                 {
@@ -1193,9 +1202,17 @@ public:
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(inputReady_[slot]);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(outputFree_[slot]);
             if (active != 0) {
-                AscendC::Mul(local, input, exponent[tile * ELEMENTS], active * HEAD_DIM);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Muls(local, local, 1.0f / 65536.0f, active * HEAD_DIM);
+                // Undo the hi/lo scale BEFORE applying the band gate factor:
+                // the old order let (raw*2^16) * 2^(band exponent) overflow
+                // fp32 first.  Production raw already carries the true scale
+                // (Stage 7), so only the CAPTURE snapshot path rescales here.
+                if constexpr (CAPTURE) {
+                    AscendC::Muls(local, input, 1.0f / 65536.0f, active * HEAD_DIM);
+                    AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::Mul(local, local, exponent[tile * ELEMENTS], active * HEAD_DIM);
+                } else {
+                    AscendC::Mul(local, input, exponent[tile * ELEMENTS], active * HEAD_DIM);
+                }
                 AscendC::Mul(product, key, rowScale, 64, active, {1, 1, 0, 16, 16, 1});
                 AscendC::Mul(product[64], key[64], rowScale, 64, active, {1, 1, 0, 16, 16, 1});
                 AscendC::PipeBarrier<PIPE_V>();
@@ -1443,11 +1460,18 @@ public:
                 }
                 AscendC::Cast(key, ub_[UB_K].ReinterpretCast<bfloat16_t>()[first * HEAD_DIM],
                               AscendC::RoundMode::CAST_NONE, count);
+                // Same reorder as Stage 9: undo the hi/lo scale before the
+                // band factor so (value*2^16) * 2^(band exponent) cannot
+                // overflow fp32 in between.  Div by a small band factor is the
+                // mirror risk (== multiply by 2^-exp), so right rescales early
+                // too.  Production values already carry the true scale.
+                if constexpr (CAPTURE) {
+                    AscendC::Muls(left, left, 1.0f / 65536.0f, count);
+                    AscendC::Muls(right, right, 1.0f / 65536.0f, count);
+                    AscendC::PipeBarrier<PIPE_V>();
+                }
                 AscendC::Mul(left, left, exponent, count);
                 AscendC::Div(right, right, exponent, count);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Muls(left, left, 1.0f / 65536.0f, count);
-                AscendC::Muls(right, right, 1.0f / 65536.0f, count);
                 AscendC::PipeBarrier<PIPE_V>();
                 AscendC::Mul(product, left, key, count);
                 AscendC::PipeBarrier<PIPE_V>();
