@@ -360,9 +360,15 @@ public:
     __aicore__ inline void Stage8(const FinalizeTilingData &tiling, const ChunkInfo &chunk, int64_t chunkIndex,
                                   int64_t firstHead, uint32_t core, uint32_t bank, GM_ADDR capture)
     {
-        for (int32_t start = ((chunk.validRows - 1) / 32) * 32; start >= 0; start -= 32) {
+        // Band grain is 16 rows: the rounded exponent anchor halves the worst
+        // in-band g spread, keeping every Stage 8/10 GEMM partial finite.
+        for (int32_t start = ((chunk.validRows - 1) / 16) * 16; start >= 0; start -= 16) {
             AscendC::CrossCoreWaitFlag<0x2, PIPE_MTE2>(BAND_READY);
-            const bool compact = FINALIZE_K && !CAPTURE && chunk.validRows == CHUNK_SIZE && start == 0;
+            // kNeg rows [0, kRows) are live: the strict-lower band GEMM only
+            // contracts k <= i < start + 16 on full chunks; tails keep 64 so
+            // zero-padded rows mask the dead columns.
+            const uint32_t kRows =
+                (FINALIZE_K && !CAPTURE && chunk.validRows == CHUNK_SIZE) ? static_cast<uint32_t>(start) + 16 : 64;
             for (uint32_t owner = 0; owner < HEADS_PER_WORK; ++owner) {
                 if (firstHead + owner >= tiling.heads) {
                     continue;
@@ -374,11 +380,10 @@ public:
                                                                        owner * WS_HEAD_BYTES + bank * WS_BANK_BYTES));
                 AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(keFree_[owner]);
                 // Both lower matrices stay in L1 through Stage 8/10 and both bands.
-                if (start == ((chunk.validRows - 1) / 32) * 32) {
+                if (start == ((chunk.validRows - 1) / 16) * 16) {
                     CopyToL1(l1.ReinterpretCast<float>(), input[WS_DAQK_FP32 / 4], 64, 64, 64, 64);
                     CopyToL1(l1[16384].ReinterpretCast<float>(), input[WS_DAKK_FP32 / 4], 64, 64, 64, 64);
                 }
-                const uint32_t kRows = compact ? 32 : 64;
                 CopyToL1(l1[32768].ReinterpretCast<float>(), input[WS_KNEG_FP32 / 4], kRows, 128, kRows, 128);
                 AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(keReady_[owner]);
             }
@@ -401,17 +406,13 @@ public:
                         AscendC::SetHF32Mode(false);
                         auto a = l1[matrix * 16384].ReinterpretCast<float>();
                         auto b = l1[32768].ReinterpretCast<float>();
-                        if (compact) {
-                            LoadBandFp32<false, false, 32>(a[start * 8], b, owner);
-                        } else {
-                            LoadBandFp32<false>(a[start * 8], b, owner);
-                        }
-                        Multiply<float>(32, 128, compact ? 32 : 64, owner);
+                        LoadBandFp32<false>(a[start * 8], b, owner, 16, kRows);
+                        Multiply<float>(16, 128, kRows, owner);
                         if (matrix == 1) {
                             AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(keFree_[owner]);
                         }
                     }
-                    auto fix = AscendC::FixpipeParamsV220(128, 32, 32, 128, false);
+                    auto fix = AscendC::FixpipeParamsV220(128, 16, 16, 128, false);
                     fix.quantPre = QuantMode_t::NoQuant;
                     for (uint32_t owner = 0; owner < HEADS_PER_WORK; ++owner) {
                         if (firstHead + owner >= tiling.heads) {
@@ -440,12 +441,12 @@ public:
                     AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(keReady_[owner]);
                     auto b = l1[32768].ReinterpretCast<float>();
                     AscendC::SetHF32Mode(false);
-                    LoadBandFp32<false>(l1[16384].ReinterpretCast<float>()[start * 8], b, 1);
-                    Multiply<float>(32, 128, 64, 1);
-                    LoadBandFp32<false>(l1.ReinterpretCast<float>()[start * 8], b, 0);
-                    Multiply<float>(32, 128, 64, 0);
+                    LoadBandFp32<false>(l1[16384].ReinterpretCast<float>()[start * 8], b, 1, 16, 64);
+                    Multiply<float>(16, 128, 64, 1);
+                    LoadBandFp32<false>(l1.ReinterpretCast<float>()[start * 8], b, 0, 16, 64);
+                    Multiply<float>(16, 128, 64, 0);
                     AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(keFree_[owner]);
-                    auto fix = AscendC::FixpipeParamsV220(128, 32, 32, 128, false);
+                    auto fix = AscendC::FixpipeParamsV220(128, 16, 16, 128, false);
                     fix.quantPre = QuantMode_t::NoQuant;
                     for (uint32_t matrix = 0; matrix < 2; ++matrix) {
                         AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(resultReady_[matrix]);
@@ -476,8 +477,10 @@ public:
                 AscendC::CrossCoreSetFlag<0x2, PIPE_MTE2>(BAND_LOADED);
             }
             if constexpr (COMPUTE_RIGHT) {
+                // Every non-final full-chunk band contracts m in [start, 64);
+                // the final band and any tail still need the full column range.
                 Stage10<CAPTURE>(tiling, chunkIndex, firstHead, core, bank, capture, start,
-                                 FINALIZE_K && !CAPTURE && chunk.validRows == CHUNK_SIZE && start == 32);
+                                 FINALIZE_K && !CAPTURE && chunk.validRows == CHUNK_SIZE && start != 0);
             }
         }
     }
@@ -490,6 +493,8 @@ public:
         // Second band handshake: qPos/bkPos are ready; Stage 9 runs independently.
         AscendC::CrossCoreWaitFlag<0x2, PIPE_MTE2>(BAND_READY);
         for (uint32_t matrix = 0; matrix < 2; ++matrix) {
+            const uint32_t kRows = compact ? 64 - start : 64;
+            const uint32_t sourceRow = compact ? start : 0;
             for (uint32_t owner = 0; owner < HEADS_PER_WORK; ++owner) {
                 if (firstHead + owner >= tiling.heads) {
                     continue;
@@ -500,8 +505,6 @@ public:
                                                                        static_cast<uint64_t>(core) * WS_CORE_BYTES +
                                                                        owner * WS_HEAD_BYTES + bank * WS_BANK_BYTES));
                 AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(keFree_[owner]);
-                const uint32_t kRows = compact ? 32 : 64;
-                const uint32_t sourceRow = compact ? 32 : 0;
                 CopyToL1(l1[32768].ReinterpretCast<float>(),
                          input[(matrix == 0 ? WS_QPOS : WS_BKPOS) / 4 + sourceRow * HEAD_DIM],
                          kRows, 128, kRows, 128);
@@ -515,21 +518,17 @@ public:
                 auto l1 = l1Buf_.Get<uint8_t>()[L1_STAGE8 + owner * L1_STAGE8_HEAD_BYTES];
                 auto a = l1[matrix * 16384].ReinterpretCast<float>();
                 auto b = l1[32768].ReinterpretCast<float>();
-                if (compact) {
-                    // lower keeps its 64-row NZ stride; B is compact 32-row NZ.
-                    LoadBandFp32<true, false, 32>(a[start * 64 + 32 * 8], b, owner);
-                } else {
-                    LoadBandFp32<true>(a[start * 64], b, owner);
-                }
+                // lower keeps its 64-row NZ stride; B is compact (64-start)-row NZ.
+                LoadBandFp32<true>(a[start * 64 + sourceRow * 8], b, owner, 16, kRows);
             }
             for (uint32_t owner = 0; owner < HEADS_PER_WORK; ++owner) {
                 if (firstHead + owner >= tiling.heads) {
                     continue;
                 }
                 AscendC::SetHF32Mode(false);
-                Multiply<float, false, true>(32, 128, compact ? 32 : 64, owner, matrix == 0, matrix == 1);
+                Multiply<float, false, true>(16, 128, kRows, owner, matrix == 0, matrix == 1);
                 if (matrix == 1) {
-                    auto fix = AscendC::FixpipeParamsV220(128, 32, 32, 128, false);
+                    auto fix = AscendC::FixpipeParamsV220(128, 16, 16, 128, false);
                     fix.quantPre = QuantMode_t::NoQuant;
                     AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(resultReady_[owner]);
                     auto result = l0CBuf_.Get<float>()[owner * L0_C_SLOT_BYTES / 4];
@@ -720,8 +719,11 @@ private:
     }
 
     // FP32 NZ uses 16x8 fractals; c220 L0B needs the 3Dv2 conversion.
-    template <bool TRANSPOSE_A, bool REUSE_B = false, uint32_t K_ROWS = 64>
-    __aicore__ inline void LoadBandFp32(AscendC::LocalTensor<float> a, AscendC::LocalTensor<float> b, uint32_t slot)
+    // Band grain is 16 rows; mRows/kRows are runtime so one instantiation
+    // serves every band shape (16xK A, 16-column transposed A window).
+    template <bool TRANSPOSE_A, bool REUSE_B = false>
+    __aicore__ inline void LoadBandFp32(AscendC::LocalTensor<float> a, AscendC::LocalTensor<float> b, uint32_t slot,
+                                        uint32_t mRows, uint32_t kRows)
     {
         auto l0A = l0ABuf_.Get<float>()[slot * L0_AB_SLOT_BYTES / 4];
         auto l0B = l0BBuf_.Get<float>()[slot * L0_AB_SLOT_BYTES / 4];
@@ -732,8 +734,8 @@ private:
             loadA.l1H = 1;
             loadA.l1W = 64;
             loadA.channelSize = 64;
-            loadA.kExtension = 32;
-            loadA.mExtension = K_ROWS;
+            loadA.kExtension = mRows;
+            loadA.mExtension = kRows;
             loadA.strideW = 1;
             loadA.strideH = 1;
             loadA.filterW = 1;
@@ -744,18 +746,18 @@ private:
             AscendC::LoadData(l0A, a, loadA);
         } else {
             AscendC::LoadData2DParams loadA{};
-            loadA.repeatTimes = K_ROWS / 8;
+            loadA.repeatTimes = kRows / 8;
             loadA.srcStride = 4;
-            for (uint32_t row = 0; row < 2; ++row) {
-                AscendC::LoadData(l0A[row * (K_ROWS / 8) * 128], a[row * 128], loadA);
+            for (uint32_t row = 0; row < mRows / 16; ++row) {
+                AscendC::LoadData(l0A[row * (kRows / 8) * 128], a[row * 128], loadA);
             }
         }
         AscendC::LoadData3DParamsV2<float> loadB{};
         loadB.l1H = 1;
-        loadB.l1W = K_ROWS;
+        loadB.l1W = kRows;
         loadB.channelSize = 128;
         loadB.kExtension = 128;
-        loadB.mExtension = K_ROWS;
+        loadB.mExtension = kRows;
         loadB.strideW = 1;
         loadB.strideH = 1;
         loadB.filterW = 1;
