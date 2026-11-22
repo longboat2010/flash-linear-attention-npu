@@ -144,7 +144,7 @@ constexpr uint32_t UB11_EXP_A = 87 * 1024 + 512;
 
 // Optional test snapshots, separate from the reusable production workspace.
 // Each (head, chunk) owns a complete record, including padding and tail rows.
-constexpr uint32_t CAPTURE_BYTES = 952 * 1024;
+constexpr uint32_t CAPTURE_BYTES = 1200 * 1024;
 constexpr uint32_t CAPTURE_DK_STATE_RAW = 0;
 constexpr uint32_t CAPTURE_DV_B = 32 * 1024;
 constexpr uint32_t CAPTURE_ZV = 64 * 1024;
@@ -171,24 +171,25 @@ constexpr uint32_t CAPTURE_DAKK_LOWER = 424 * 1024;
 constexpr uint32_t CAPTURE_DAQK_DIAG = 440 * 1024;
 constexpr uint32_t CAPTURE_BANDS = 448 * 1024;
 constexpr uint32_t CAPTURE_BAND_BYTES = 116 * 1024;
-constexpr uint32_t CAPTURE_DQ_LOCAL = 680 * 1024;
-constexpr uint32_t CAPTURE_LEFT = 712 * 1024;
-constexpr uint32_t CAPTURE_DQ = 744 * 1024;
-constexpr uint32_t CAPTURE_DG = 776 * 1024;
-constexpr uint32_t CAPTURE_RIGHT = 808 * 1024;
+constexpr uint32_t CAPTURE_DQ_LOCAL = 912 * 1024;
+constexpr uint32_t CAPTURE_LEFT = 944 * 1024;
+constexpr uint32_t CAPTURE_DQ = 976 * 1024;
+constexpr uint32_t CAPTURE_DG = 1008 * 1024;
+constexpr uint32_t CAPTURE_RIGHT = 1040 * 1024;
 constexpr uint32_t WS_RIGHT = WS_KNEG; // Stage 8 has consumed kNeg before Stage 10 writes.
-constexpr uint32_t CAPTURE_DK = 840 * 1024;
-constexpr uint32_t CAPTURE_DB = 872 * 1024;
-constexpr uint32_t CAPTURE_SCAN = 880 * 1024;
-constexpr uint32_t CAPTURE_GATE = 912 * 1024;
-constexpr uint32_t CAPTURE_PARTIAL = 944 * 1024;
+constexpr uint32_t CAPTURE_DK = 1072 * 1024;
+constexpr uint32_t CAPTURE_DB = 1104 * 1024;
+constexpr uint32_t CAPTURE_SCAN = 1112 * 1024;
+constexpr uint32_t CAPTURE_GATE = 1144 * 1024;
+constexpr uint32_t CAPTURE_PARTIAL = 1176 * 1024;
 // kE and Zb snapshots contain FP32 elements, including zero-padded tail rows.
 static_assert(CAPTURE_EXP2_GK + CHUNK_SIZE * HEAD_DIM * sizeof(float) <= CAPTURE_KE);
 static_assert(CAPTURE_KE + CHUNK_SIZE * HEAD_DIM * sizeof(float) <= CAPTURE_RH);
 static_assert(CAPTURE_ZW + CHUNK_SIZE * CHUNK_SIZE * sizeof(float) <= CAPTURE_ZB);
 static_assert(CAPTURE_ZB + CHUNK_SIZE * CHUNK_SIZE * sizeof(float) <= CAPTURE_DB_V);
 static_assert(CAPTURE_PARTIAL + PARTIAL_FLOATS * sizeof(float) <= CAPTURE_BYTES);
-static_assert(CAPTURE_BANDS + 2 * CAPTURE_BAND_BYTES == CAPTURE_DQ_LOCAL);
+// Band grain is 16 rows: four band snapshots follow the lower matrices.
+static_assert(CAPTURE_BANDS + 4 * CAPTURE_BAND_BYTES == CAPTURE_DQ_LOCAL);
 static_assert(WS_LEFT + 32 * 1024 == WS_DAQK_FP32);
 static_assert(WS_DAQK_FP32 + 16 * 1024 == WS_KNEG_FP32);
 static_assert(WS_KNEG_FP32 + 32 * 1024 == WS_DAKK_FP32);
